@@ -899,24 +899,29 @@ fn orchestrate_cli(
             0
         }
         Err(error) => {
+            // The code alone was the whole diagnosis: a certificate/key pair
+            // that does not match reported `connect_probe_failed` and nothing
+            // more. The failing stage's own reason rides alongside it.
+            let detail = error.detail();
             if json_output {
+                let mut fields = vec![("code".into(), Value::String(error.code().into()))];
+                if let Some(detail) = detail {
+                    fields.push(("detail".into(), Value::String(detail.into())));
+                }
                 println!(
                     "{}",
                     Value::Object(vec![
                         ("schema".into(), Value::Number("1".into())),
                         ("status".into(), Value::String("error".into())),
-                        (
-                            "error".into(),
-                            Value::Object(vec![(
-                                "code".into(),
-                                Value::String(error.code().into())
-                            )]),
-                        ),
+                        ("error".into(), Value::Object(fields)),
                     ])
                     .to_json()
                 );
             } else {
-                eprintln!("federation connect: {}", error.code());
+                match detail {
+                    Some(detail) => eprintln!("federation connect: {}: {detail}", error.code()),
+                    None => eprintln!("federation connect: {}", error.code()),
+                }
             }
             connect_sysexit(&error)
         }

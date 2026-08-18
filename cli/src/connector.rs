@@ -130,6 +130,22 @@ impl ProbeError {
             ProbeError::ConfigurationFailure(_) => "tls_configuration_failure",
         }
     }
+
+    /// The one extra fact a `code()` cannot carry: which filter was denied,
+    /// which credential input was refused, which envelope rule was broken.
+    ///
+    /// `code()` alone was the whole diagnosis an operator got, and for a bad
+    /// key that meant `connect_probe_failed` and nothing else. Every value
+    /// here is a stable reason or a rule name, never credential material.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            ProbeError::SubscribeDenied { filter } => Some(filter),
+            ProbeError::InvalidProbe(detail) | ProbeError::ConfigurationFailure(detail) => {
+                Some(detail)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The non-secret inputs the connector supplies to build the probe. Every field
@@ -508,26 +524,15 @@ fn build_tls_transport(
     roots: &rustls::RootCertStore,
     client_auth: &Option<(Vec<u8>, Vec<u8>)>,
 ) -> Result<rumqttc::Transport, &'static str> {
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots.clone());
-    let config = if let Some((cert_pem, key_pem)) = client_auth {
-        use std::io::Cursor;
-        let mut cert_reader = Cursor::new(cert_pem.as_slice());
-        let certs = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "certificate PEM parsing failed")?;
-        let mut key_reader = Cursor::new(key_pem.as_slice());
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|_| "private key PEM parsing failed")?
-            .ok_or("no private key in PEM")?;
-        if certs.is_empty() {
-            return Err("empty certificate in PEM");
-        }
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|_| "TLS client auth configuration failed")?
-    } else {
-        builder.with_no_client_auth()
-    };
+    // Credential semantics live in `provisioning`, which owns the identity
+    // files; this module only needs the finished configuration. That is also
+    // what lets the typed credential reasons be tested without a broker.
+    let config = crate::provisioning::build_client_config(
+        roots,
+        client_auth
+            .as_ref()
+            .map(|(cert, key)| (cert.as_slice(), key.as_slice())),
+    )?;
     Ok(rumqttc::Transport::tls_with_config(
         rumqttc::TlsConfiguration::Rustls(std::sync::Arc::new(config)),
     ))
@@ -1667,6 +1672,19 @@ pub fn provision_session(
 pub mod reason {
     pub const ENDPOINT_MALFORMED: &str = "endpoint-malformed";
     pub const CREDENTIAL_REF_UNRESOLVED: &str = "credential-ref-unresolved";
+    /// `client.pem` holds no certificate this runtime can parse. Named
+    /// separately from the key reasons so the operator knows which of the two
+    /// files to look at.
+    pub const CERTIFICATE_MALFORMED: &str = "certificate-malformed";
+    /// `key.pem` holds no private key this runtime can use: no key block at
+    /// all, or a container it understands wrapping bytes it cannot load.
+    /// PKCS#8, SEC1, and PKCS#1 are all accepted, so this is a genuinely
+    /// unusable key rather than an unfashionable encoding.
+    pub const KEY_FORMAT_UNSUPPORTED: &str = "key-format-unsupported";
+    /// `key.pem` loads, but it is not the key inside `client.pem`. Caught here
+    /// rather than deep in a handshake, where the broker's side of the story
+    /// names neither file.
+    pub const KEY_CERT_MISMATCH: &str = "key-cert-mismatch";
     /// No identity bundle at the identity path (`client.pem`/`key.pem` missing):
     /// the certificate is the machine's only identity source, so a machine with
     /// none cannot open a session and nothing is minted to paper over it.
@@ -3535,6 +3553,19 @@ impl ConnectError {
             ConnectError::EnrollmentConflict => "enrollment_conflict",
             ConnectError::ActivationFailed(_) => "connect_activation_failed",
             ConnectError::RollbackIncomplete(_) => "rollback_incomplete",
+        }
+    }
+
+    /// The failing stage's own reason, so `connect_probe_failed` stops being
+    /// the entire story. A probe that failed because `key.pem` is not the key
+    /// in `client.pem` now says so.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            ConnectError::Probe(probe) => probe.detail(),
+            ConnectError::ActivationFailed(detail) | ConnectError::RollbackIncomplete(detail) => {
+                Some(detail)
+            }
+            ConnectError::Registry(_) | ConnectError::EnrollmentConflict => None,
         }
     }
 }
@@ -6255,6 +6286,35 @@ mod snapshot_tests {
         }
     }
 
+    /// `code()` alone was the entire diagnosis a failed connect produced. A
+    /// probe that failed on the credentials must be able to say which input.
+    #[test]
+    fn a_failed_connect_carries_the_failing_stage_reason() {
+        let mismatch = ConnectError::Probe(ProbeError::ConfigurationFailure(
+            reason::KEY_CERT_MISMATCH.to_owned(),
+        ));
+        assert_eq!(mismatch.code(), "connect_probe_failed");
+        assert_eq!(
+            mismatch.detail(),
+            Some(reason::KEY_CERT_MISMATCH),
+            "a mismatched key/cert pair must name itself, not just the probe"
+        );
+
+        // A denied subscribe names the filter, which is the equivalent fact
+        // for that stage.
+        let denied = ConnectError::Probe(ProbeError::SubscribeDenied {
+            filter: "loam/v1/acme/widgets/#".to_owned(),
+        });
+        assert_eq!(denied.detail(), Some("loam/v1/acme/widgets/#"));
+
+        // Stages with nothing to add stay silent rather than inventing text.
+        assert_eq!(
+            ConnectError::Probe(ProbeError::AuthenticationFailed).detail(),
+            None
+        );
+        assert_eq!(ConnectError::EnrollmentConflict.detail(), None);
+    }
+
     #[test]
     fn the_failure_codes_are_unchanged_and_the_reasons_are_additive() {
         // `code()` is a tested IPC contract other slices pin, so the reason is
@@ -6278,6 +6338,9 @@ mod snapshot_tests {
         let all = [
             reason::ENDPOINT_MALFORMED,
             reason::CREDENTIAL_REF_UNRESOLVED,
+            reason::CERTIFICATE_MALFORMED,
+            reason::KEY_FORMAT_UNSUPPORTED,
+            reason::KEY_CERT_MISMATCH,
             reason::IDENTITY_REQUIRED,
             reason::CA_UNRESOLVED,
             reason::ROSTER_ABSENT,
